@@ -1,7 +1,7 @@
 import socket
 import struct
 import threading
-import time
+import select
 import hmac
 import hashlib
 import math
@@ -13,16 +13,34 @@ from merlin_transcripts import MerlinTranscript
 
 from .simple_pool import SimplePool
 
+from proto import NodeInfo
+
 
 class SecretConnection:
+    """ Encode and decode"""
     AEAD_SIZE_OVERHEAD = 16
-
     DATA_LEN_SIZE = 4
     DATA_MAX_SIZE = 1024
     TOTAL_FRAME_SIZE = 1028
 
+    """ Node info """
+    PROTOCOL_VERSION: dict = {
+        "p2p": 8,
+        "block": 11,
+    }
+    LISTEN_ADDR: str = "tcp://0.0.0.0:26656"
+    NETWORK: str = "pacific-1"
+    VERSION: str = "0.35.0-unreleased"
+    CHANNELS: str = "40202122233038606162630070717273"
+    MONIKER: str = "node"
+    NODE_INFO_OTHER: dict = {
+        "tx_index": "on",
+        "rpc_address": "tcp://127.0.0.1:26657"
+    }
+
 
     def __init__(self, host: str, port: int):
+        self.running: bool = False
         self.host = host
         self.port = port
         self.socket = None
@@ -37,15 +55,20 @@ class SecretConnection:
         # Create buffer pool
         self.pool = SimplePool(max(self.TOTAL_FRAME_SIZE, self.AEAD_SIZE_OVERHEAD + self.TOTAL_FRAME_SIZE),2)
 
+        # Node Infos
+        self.node_id: str = ""
+        self.moniker: str = ""
+
     def connect(self) -> None:
         """Establish secure connection using STS protocol"""
 
         # Generate main public and private key
-        local_pub_key, local_priv_key = self.generate_keys()
+        self._local_pub_key, self._local_priv_key = self.generate_keys()
 
         # Create socket connection
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.connect((self.host, self.port))
+        self.socket.setblocking(True)
 
         # Generate ephemeral keypair
         local_eph_pub_key, local_eph_priv_key = self._generate_ephemeral_keypair()
@@ -81,12 +104,15 @@ class SecretConnection:
         challenge = transcript.challenge_bytes(b"SECRET_CONNECTION_MAC", 32)
 
         # Sign challenge with long-term private key
-        signature_key = ed25519.Ed25519PrivateKey.from_private_bytes(local_priv_key)
+        signature_key = ed25519.Ed25519PrivateKey.from_private_bytes(self._local_priv_key)
         local_signature = signature_key.sign(challenge)
         signature_key.public_key().verify(local_signature, challenge)
 
         # Exchange main public key and signature
-        self._exchange_auth(local_pub_key, local_signature)
+        self._exchange_auth(self._local_pub_key, local_signature)
+
+        # Connection was successful
+        self.running = True
 
     @staticmethod
     def generate_keys() -> tuple[bytes, bytes]:
@@ -154,7 +180,7 @@ class SecretConnection:
 
     def read(self) -> bytes:
         """
-        Read data from the secret connection.
+        Read data from the secret connection, waiting exactly until all required data is available.
         """
         with self.recv_mtx:
             # Get buffers from pool
@@ -162,16 +188,35 @@ class SecretConnection:
             frame = self.pool.get(self.TOTAL_FRAME_SIZE)
 
             try:
-                # Read encrypted frame
-                bytes_read = self.socket.recv_into(sealed_frame, self.AEAD_SIZE_OVERHEAD + self.TOTAL_FRAME_SIZE)
-                if bytes_read == 0:
-                    raise ConnectionError("Connection closed")
+                total_required = self.AEAD_SIZE_OVERHEAD + self.TOTAL_FRAME_SIZE
+                bytes_received = 0
+
+                # Wait to receive all required bytes
+                while bytes_received < total_required:
+                    # Wait for data to be available
+                    ready = select.select([self.socket], [], [], None)[0]
+                    if not ready:
+                        continue
+
+                    # Calculate remaining bytes to read
+                    remaining = total_required - bytes_received
+
+                    # Read exactly the remaining bytes needed
+                    chunk = self.socket.recv_into(
+                        memoryview(sealed_frame)[bytes_received:],
+                        remaining
+                    )
+
+                    if chunk == 0:
+                        raise ConnectionError("Connection closed")
+
+                    bytes_received += chunk
 
                 # Decrypt the frame
                 try:
                     decrypted = self.recv_cipher.decrypt(
                         self.get_recv_nonce(),
-                        sealed_frame[:bytes_read],
+                        sealed_frame[:total_required],
                         None  # No associated data
                     )
                 except Exception as e:
@@ -193,6 +238,25 @@ class SecretConnection:
                 # Return buffers to pool
                 self.pool.put(sealed_frame)
                 self.pool.put(frame)
+
+    def get_node_id(self) -> str:
+        sha256_hash = hashlib.sha256(self._local_pub_key).digest()
+        node_id_bytes = sha256_hash[:20]
+        return node_id_bytes.hex()
+
+    def get_node_info(self) -> bytes:
+        node_info = NodeInfo()
+        node_info.protocol_version.p2p = self.PROTOCOL_VERSION["p2p"]
+        node_info.protocol_version.block = self.PROTOCOL_VERSION["block"]
+        node_info.node_id = self.get_node_id()
+        node_info.listen_addr = self.LISTEN_ADDR
+        node_info.network = self.NETWORK
+        node_info.version = self.VERSION
+        node_info.channels = bytes.fromhex(self.CHANNELS)
+        node_info.moniker = self.MONIKER
+        node_info.other.tx_index = self.NODE_INFO_OTHER["tx_index"]
+        node_info.other.rpc_address = self.NODE_INFO_OTHER["rpc_address"]
+        return node_info.SerializeToString()
 
     """ Helper methods for initiating secure connection """
 
@@ -277,7 +341,13 @@ class SecretConnection:
 
         # Receive peer's encrypted auth message
         encrypted_auth = self.read()
-        time.sleep(1)
 
+        # Receive peer's info
         node_data = self.read()
-        print(node_data)
+        node_info = NodeInfo()
+        node_info.deserialize(node_data[2:])
+        self.node_id = node_info.node_id
+        self.moniker: str = node_info.moniker
+
+        # Write own
+        self.write(node_data[:2] + self.get_node_info())
